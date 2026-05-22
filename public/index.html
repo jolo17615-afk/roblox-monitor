@@ -125,7 +125,7 @@
 </div>
 
 <script>
-    const socket = io();
+const socket = io(window.location.origin);
     const creationFeed = document.getElementById('creation-feed');
     const banFeed = document.getElementById('ban-feed');
     const emptyCreations = document.getElementById('empty-creations');
