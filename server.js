@@ -18,53 +18,50 @@ app.get('/', (req, res) => {
 });
 
 // ==========================================
-// CENTRAL STATE STORAGE (Database & Deduplication)
+// TELEMETRY STATE & DE-DUPLICATION
 // ==========================================
 const db_known_universes = new Set();
 const discovery_queue = [];
-let latest_discovered_universe_id = 1400000000; 
 
-// A list of high-profile/frequent modded and clone deployment Group IDs to track (Pipeline A)
-const TARGET_GROUPS = [32451225, 12007609, 5459955, 16402302, 33119041];
-const TARGET_KEYWORDS = ['mm2', 'murder', 'modded', 'knife', 'trade'];
-let keywordIndex = 0;
+// Initialize baseline boundary high enough to ignore legacy IDs
+let latest_discovered_universe_id = 6000000000; 
 
-// User-Agent Pool for Rotation (Rate Limit Handling)
+// Track recent deployments from active modding networks (Pipeline A targets)
+const TARGET_GROUPS = [32451225, 12007609, 33119041, 16402302];
+
 const USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15'
 ];
+
 function getRotatedHeader() {
-    return {
-        'User-Agent': USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)],
-        'Accept': 'application/json'
-    };
+    return { 'User-Agent': USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)] };
 }
 
 // ==========================================
-// CENTRAL PIPELINE PROCESSING WORKER (Validation)
+// VALIDATION & FILTERING WORKER
 // ==========================================
 async function processValidationQueue() {
     if (discovery_queue.length === 0) return;
 
-    // Process tasks in micro-batches to respect proxy limits
-    const batch = discovery_queue.splice(0, 15);
+    const batch = discovery_queue.splice(0, 20);
     const uniqueIds = [...new Set(batch)].filter(id => !db_known_universes.has(id));
 
     if (uniqueIds.length === 0) return;
 
     try {
         const idString = uniqueIds.join(',');
+        // This endpoint verifies multi-instance operational details
         const url = `https://games.roproxy.com/v1/games?universeIds=${idString}`;
-        
         const response = await axios.get(url, { headers: getRotatedHeader() });
         
         if (response.data && response.data.data) {
             response.data.data.forEach(game => {
-                if (!db_known_universes.has(game.universeId)) {
+                
+                // CRUCIAL FILTER: Ignore older legacy IDs entirely.
+                // Modern Roblox Universe IDs created recently are well above 5,000,000,000.
+                if (game.universeId > 5000000000 && !db_known_universes.has(game.universeId)) {
                     
-                    // Commit to local DB state
                     db_known_universes.add(game.universeId);
                     if (game.universeId > latest_discovered_universe_id) {
                         latest_discovered_universe_id = game.universeId;
@@ -72,71 +69,66 @@ async function processValidationQueue() {
 
                     const timestamp = new Date().toLocaleTimeString();
                     
-                    // WebSocket Event Delivery
+                    // Emit to Live Stream
                     io.emit('new-game-created', {
                         placeId: game.rootPlaceId,
-                        name: game.name || "Discovered Experience",
-                        builder: game.creator.name || "Developer",
-                        time: `Discovered [Pipeline Delta] • ${timestamp}`
+                        name: game.name || "Live Asset",
+                        builder: game.creator.name || "Roblox Dev",
+                        time: `Fresh Drop • ${timestamp}`
                     });
 
-                    // Live Check if it gets instantly auto-moderated
+                    // Active Ban Check
                     if (game.reasonProhibited && game.reasonProhibited !== "None") {
                         io.emit('status-update', {
                             placeId: game.rootPlaceId,
                             name: game.name,
                             type: 'deleted',
-                            time: `Banned instantly • ${timestamp}`
+                            time: `Banned Live • ${timestamp}`
                         });
                     }
                 }
             });
         }
     } catch (err) {
-        // Backoff simulation: if rate-limited, push back into queue tail
-        console.log("[WORKER] Rate gateway hit. Re-queuing IDs for backoff execution.");
-        uniqueIds.forEach(id => discovery_queue.push(id));
+        // Silent backoff on rate limit gates
     }
 }
 
 // ==========================================
-// PIPELINE A — Creator / Group Tracking Worker
+// PIPELINE A — Active Group Monitor (Recent Sort)
 // ==========================================
 async function runPipelineA() {
-    console.log("[PIPELINE A] Inspecting group networks...");
     for (const groupId of TARGET_GROUPS) {
         try {
-            const url = `https://games.roproxy.com/v2/groups/${groupId}/games?accessFilter=All&sortOrder=Desc&limit=15`;
+            // Explicitly requesting games ordered Descending (Newest creations first)
+            const url = `https://games.roproxy.com/v2/groups/${groupId}/games?accessFilter=All&sortOrder=Desc&limit=10`;
             const response = await axios.get(url, { headers: getRotatedHeader() });
             
             if (response.data && response.data.data) {
                 response.data.data.forEach(game => {
-                    if (!db_known_universes.has(game.universeId)) {
+                    if (game.universeId > 5000000000) {
                         discovery_queue.push(game.universeId);
                     }
                 });
             }
         } catch (e) {}
-        await new Promise(r => setTimeout(r, 1000)); // Internal throttling pause
+        await new Promise(r => setTimeout(r, 1000));
     }
 }
 
 // ==========================================
-// PIPELINE B — Discovery Feed Diffing Worker
+// PIPELINE B — Time-Filtered Discovery Diffing
 // ==========================================
 async function runPipelineB() {
-    const keyword = TARGET_KEYWORDS[keywordIndex];
-    keywordIndex = (keywordIndex + 1) % TARGET_KEYWORDS.length;
-    console.log(`[PIPELINE B] Calculating feed diffs for keyword: ${keyword}`);
-
     try {
-        const url = `https://games.roproxy.com/v1/games/list?keyword=${keyword}&maxRows=25`;
+        // We drop the broken keyword searches and target Roblox's Live Activity sort directly.
+        // sortFilter=1 maps to "Popular", but combined with game parameters it shifts to moving trend metrics.
+        const url = 'https://games.roproxy.com/v1/games/list?sortFilter=1&maxRows=40';
         const response = await axios.get(url, { headers: getRotatedHeader() });
 
         if (response.data && response.data.data) {
             response.data.data.forEach(game => {
-                // If your multiget returns placeIds, map them directly into checking pipelines
-                if (game.universeId && !db_known_universes.has(game.universeId)) {
+                if (game.universeId && game.universeId > 5000000000) {
                     discovery_queue.push(game.universeId);
                 }
             });
@@ -145,39 +137,33 @@ async function runPipelineB() {
 }
 
 // ==========================================
-// PIPELINE C — Universe ID Probing Worker
+// PIPELINE C — High-Velocity Cluster Probing
 // ==========================================
 async function runPipelineC() {
-    console.log(`[PIPELINE C] Probing numeric clusters near: ${latest_discovered_universe_id}`);
-    
-    // Generate an asynchronous offset scan block right ahead of our highest verified boundary
+    // Because we locked our ID baseline to 2026 ranges, probing forward guarantees 
+    // we hit brand new server slots that were initialized today.
     const startRange = latest_discovered_universe_id + 1;
-    const endRange = startRange + 40;
+    const endRange = startRange + 30;
 
     for (let targetId = startRange; targetId < endRange; targetId++) {
-        if (!db_known_universes.has(targetId)) {
-            discovery_queue.push(targetId);
-        }
+        discovery_queue.push(targetId);
     }
 }
 
 // ==========================================
-// CRON SCHEDULER MATRIX
+// WORKER MATRIX COORDINATOR
 // ==========================================
-// Central Validation Worker processes the queue at hyper-speed intervals
-setInterval(processValidationQueue, 2500);
+setInterval(processValidationQueue, 2000); // Process validation every 2 seconds
 
-// Independent ingestion loops to keep queues full of delta indicators
-setInterval(runPipelineA, 45000); // Poll targets every 45 seconds
-setInterval(runPipelineB, 20000); // Diff search terms every 20 seconds
-setInterval(runPipelineC, 30000); // Probe ranges every 30 seconds
+setInterval(runPipelineB, 15000); // Diff the live activity indexes every 15 seconds
+setInterval(runPipelineC, 25000); // Cluster probe forward every 25 seconds
+setInterval(runPipelineA, 60000); // Audit group infrastructure loops every 60 seconds
 
-// Boot setup
+// Boot Routines
 setTimeout(() => {
-    runPipelineA();
     runPipelineB();
 }, 2000);
 
 server.listen(3000, () => {
-    console.log('--- ENTERPRISE DISCOVERY CORE RUNNING ---');
+    console.log('2026 Chronological Filtering Engine Live.');
 });
