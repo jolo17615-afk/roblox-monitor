@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live Roblox Ban Wave Monitor</title>
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+        :root {
+            --bg-primary: #313338;
+            --bg-secondary: #2b2d31;
+            --bg-embed: #1e1f22;
+            --text-normal: #dbdee1;
+            --text-muted: #949ba4;
+            --text-link: #00a8fc;
+            --status-green: #23a55a;
+            --status-red: #f23f43;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg-primary);
+            color: var(--text-normal);
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+        }
+
+        .monitor-container {
+            width: 100%;
+            max-width: 650px;
+            background-color: var(--bg-secondary);
+            border-radius: 8px;
+            padding: 16px;
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.3);
+        }
+
+        .header {
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+            padding-bottom: 12px;
+            margin-bottom: 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .header h1 {
+            margin: 0;
+            font-size: 1.2rem;
+        }
+
+        .live-indicator {
+            font-size: 0.8rem;
+            background-color: var(--status-green);
+            color: white;
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-weight: bold;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 0.6; }
+            50% { opacity: 1; }
+            100% { opacity: 0.6; }
+        }
+
+        .embed-card {
+            background-color: var(--bg-embed);
+            border-radius: 4px;
+            border-left: 4px solid transparent;
+            padding: 12px 16px;
+            margin-bottom: 12px;
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            animation: slideIn 0.3s ease-out;
+        }
+
+        @keyframes slideIn {
+            from { transform: translateY(-10px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+
+        .embed-card.restored { border-left-color: var(--status-green); }
+        .embed-card.deleted { border-left-color: var(--status-red); }
+
+        .embed-content { flex: 1; }
+        .status-title { font-weight: bold; font-size: 0.95rem; margin-bottom: 8px; color: #fff;}
+        .description { font-size: 0.9rem; margin-bottom: 8px; }
+        
+        .game-link {
+            color: var(--text-link);
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .field { font-size: 0.85rem; margin-bottom: 6px; }
+        .field-label {
+            font-weight: bold;
+            color: var(--text-muted);
+            display: block;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            margin-bottom: 2px;
+        }
+
+        .field-value {
+            font-family: monospace;
+            background: rgba(0,0,0,0.2);
+            padding: 2px 4px;
+            border-radius: 3px;
+        }
+
+        .embed-footer {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-top: 8px;
+            border-top: 1px solid rgba(255, 255, 255, 0.04);
+            padding-top: 6px;
+        }
+
+        .no-events {
+            text-align: center;
+            color: var(--text-muted);
+            padding: 40px 0;
+            font-style: italic;
+        }
+    </style>
+</head>
+<body>
+
+<div class="monitor-container">
+    <div class="header">
+        <h1>📊 Real-Time Roblox Deletion Monitor</h1>
+        <div class="live-indicator">LIVE MONITORING</div>
+    </div>
+
+    <div id="feed-container">
+        <div class="no-events" id="empty-message">Waiting for live deletion/restoration cycles...</div>
+    </div>
+</div>
+
+<script>
+    const socket = io();
+    const feedContainer = document.getElementById('feed-container');
+    const emptyMessage = document.getElementById('empty-message');
+
+    // Triggered instantly whenever the backend detects a status shift
+    socket.on('status-update', (data) => {
+        if (emptyMessage) emptyMessage.remove();
+
+        const card = document.createElement('div');
+        card.className = `embed-card ${data.type}`;
+
+        const isRestored = data.type === 'restored';
+        const titleIcon = isRestored ? '✅' : '🚫';
+        const titleText = isRestored ? 'Game Restored / Undeleted' : 'Game Deleted / Restricted';
+        const actionText = isRestored ? 'is now active again and no longer marked as deleted.' : 'has been detected as deleted or restricted.';
+
+        card.innerHTML = `
+            <div class="embed-content">
+                <div class="status-title">${titleIcon} ${titleText}</div>
+                <div class="description">
+                    ✒️ <a href="https://www.roblox.com/games/${data.placeId}" target="_blank" class="game-link">${data.name}</a> ${actionText}
+                </div>
+                <div class="field">
+                    <span class="field-label">Place ID</span>
+                    <span class="field-value">${data.placeId}</span>
+                </div>
+                <div class="embed-footer">
+                    Deletion Monitor • ${data.time}
+                </div>
+            </div>
+        `;
+
+        // Prepend so the newest ban alerts show up at the top
+        feedContainer.insertBefore(card, feedContainer.firstChild);
+    });
+</script>
+</body>
+</html>
