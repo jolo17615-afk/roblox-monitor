@@ -9,51 +9,34 @@ const io = new Server(server);
 
 app.use(express.static('public'));
 
-// The list of Place IDs you want to actively monitor (e.g. Modded MM2 clones)
+// The list of Place IDs you want to actively monitor
 const TARGET_PLACES = [1095759499738, 16302801369, 185655149]; 
 
-// Keeps track of the last known state of each game
-// States: 'active', 'deleted', or 'unknown'
 let cache = {};
 TARGET_PLACES.forEach(id => {
-    cache[id] = { status: 'unknown', name: 'Loading...' };
+    cache[id] = { status: 'unknown', name: `Game #${id}` };
 });
 
-// Main function to check the Roblox API via RoProxy
 async function checkGameStatuses() {
-    console.log("Checking Roblox API for updates...");
-    
-    // Roblox games API expects Universe IDs, but we can query metadata via multiget-place-details
-    const placeIdString = TARGET_PLACES.join(',');
-    const url = `https://games.roproxy.com/v1/games/multiget-place-details?placeIds=${placeIdString}`;
+    console.log("Checking Roblox API via open asset proxy...");
 
-    try {
-        const response = await axios.get(url);
-        const dataList = response.data;
+    for (const id of TARGET_PLACES) {
+        // Using the item-details asset endpoint which is generally wide open publicly
+        const url = `https://economy.roproxy.com/v2/assets/${id}/details`;
 
-        // Map response by place ID for easier lookup
-        const apiMap = {};
-        dataList.forEach(game => {
-            apiMap[game.placeId] = game;
-        });
+        try {
+            const response = await axios.get(url);
+            const gameData = response.data;
+            
+            let currentStatus = 'active';
+            let gameName = gameData.Name || `Game #${id}`;
 
-        TARGET_PLACES.forEach(id => {
-            const gameData = apiMap[id];
-            let currentStatus = 'deleted'; // Default if it completely missing or lacks standard fields
-            let gameName = cache[id]?.name || "Unknown Game";
-
-            if (gameData) {
-                gameName = gameData.name;
-                // If the game is private or under review/deleted, 'isPlayable' drops to false
-                // Advanced tracking looks at reasonProhibited fields if available
-                if (gameData.isPlayable === true || gameData.reasonProhibited === "None") {
-                    currentStatus = 'active';
-                } else {
-                    currentStatus = 'deleted';
-                }
+            // If a game gets reviewed or banned, Roblox changes the IsForSale/Creator status 
+            // or the asset is flagged. We check if it returns valid data or an asset error.
+            if (!gameData || gameData.IsPublicDomain === undefined && !gameData.Name) {
+                currentStatus = 'deleted';
             }
 
-            // Check if state changed since last tick
             const previousStatus = cache[id].status;
             if (previousStatus !== 'unknown' && previousStatus !== currentStatus) {
                 const timestamp = new Date().toLocaleTimeString();
@@ -65,26 +48,45 @@ async function checkGameStatuses() {
                     time: `Today at ${timestamp}`
                 };
 
-                // Alert all connected web dashboard clients instantly
                 io.emit('status-update', logPayload);
-                console.log(`[ALERT] ${gameName} (${id}) changed to ${currentStatus.toUpperCase()}`);
+                console.log(`[ALERT] ${gameName} (${id}) shifted to ${currentStatus.toUpperCase()}`);
             }
 
-            // Update local state cache
             cache[id] = { status: currentStatus, name: gameName };
-        });
 
-    } catch (error) {
-        console.error("Error fetching data from Roblox RoProxy API:", error.message);
+        } catch (error) {
+            // If the asset throws a 404 or 403, it means it's content deleted / banned!
+            if (error.response && (error.response.status === 404 || error.response.status === 403)) {
+                let gameName = cache[id]?.name || `Game #${id}`;
+                let currentStatus = 'deleted';
+
+                const previousStatus = cache[id].status;
+                if (previousStatus !== 'unknown' && previousStatus !== currentStatus) {
+                    const timestamp = new Date().toLocaleTimeString();
+                    const logPayload = {
+                        placeId: id,
+                        name: gameName,
+                        type: 'deleted',
+                        time: `Today at ${timestamp}`
+                    };
+                    io.emit('status-update', logPayload);
+                    console.log(`[ALERT] ${gameName} (${id}) is DELETED (API returned ${error.response.status})`);
+                }
+                cache[id] = { status: currentStatus, name: gameName };
+            } else {
+                console.error(`Error querying ID ${id}:`, error.message);
+            }
+        }
+        
+        // Brief 1-second pause between requests so we don't spam the proxy rate limits
+        await new Promise(resolve => setTimeout(resolve, 1000));
     }
 }
 
-// Poll the Roblox API every 15 seconds
-setInterval(checkGameStatuses, 15000);
-
-// Initialize initial cache check on boot
+// Check every 30 seconds to keep the free proxy happy
+setInterval(checkGameStatuses, 30000);
 setTimeout(checkGameStatuses, 2000);
 
 server.listen(3000, () => {
-    console.log('Server live on http://localhost:3000');
+    console.log('Server live and monitoring.');
 });
