@@ -10,55 +10,64 @@ const io = new Server(server);
 app.use(express.static(__dirname));
 app.use(express.static('public'));
 
-// Keeps track of games we've already displayed so we don't duplicate them
 const seenGames = new Set();
 
-// Fetch newly populated games from Roblox's real-time sorting filters
+// Poll newly created assets (like badges) to instantly find their parents (games)
 async function scanNewCreations() {
     try {
-        // This endpoint returns an active feed of experiences currently updating/running on the platform
-        // sortFilter=1 (Popular/Recently Updated) or custom token scraping
-        const url = 'https://games.roproxy.com/v1/games/list?sortFilter=1&timeFilter=0&genreFilter=1&maxRows=25';
-        const response = await axios.get(url);
+        // We scrape recent badges globally across Roblox.
+        // This endpoint remains open and chronological since badges are catalog items.
+        const badgeCatalogUrl = 'https://badges.roproxy.com/v1/badges/universes/voted-up?page=1&limit=25';
+        const response = await axios.get(badgeCatalogUrl);
         
         if (response.data && response.data.data) {
-            const currentGames = response.data.data;
+            const recentBadges = response.data.data;
 
-            currentGames.forEach(game => {
-                // If it's a completely new ID our tracker hasn't caught yet
-                if (!seenGames.has(game.placeId)) {
-                    seenGames.add(game.placeId);
+            // Extract the unique universe IDs attached to these brand new assets
+            const universeIds = [...new Set(recentBadges.map(item => item.id).filter(Boolean))];
 
-                    // Prevent memory leak by keeping cache limited to last 1000 items
-                    if (seenGames.size > 1000) {
-                        const firstKey = seenGames.values().next().value;
-                        seenGames.delete(firstKey);
+            if (universeIds.length === 0) return;
+
+            // Translate those Universe IDs into readable Place Details
+            const universeString = universeIds.slice(0, 15).join(',');
+            const gamesUrl = `https://games.roproxy.com/v1/games?universeIds=${universeString}`;
+            const gamesResponse = await axios.get(gamesUrl);
+
+            if (gamesResponse.data && gamesResponse.data.data) {
+                gamesResponse.data.data.forEach(game => {
+                    if (!seenGames.has(game.rootPlaceId)) {
+                        seenGames.add(game.rootPlaceId);
+
+                        // Keep local cache memory clean
+                        if (seenGames.size > 500) {
+                            const firstKey = seenGames.values().next().value;
+                            seenGames.delete(firstKey);
+                        }
+
+                        const timestamp = new Date().toLocaleTimeString();
+                        const payload = {
+                            placeId: game.rootPlaceId,
+                            name: game.name || "Active Room",
+                            builder: game.creator.name || "Robloxian",
+                            time: `Discovered at ${timestamp}`
+                        };
+
+                        // Push immediately to the live creation dashboard window
+                        io.emit('new-game-created', payload);
                     }
-
-                    const timestamp = new Date().toLocaleTimeString();
-                    const payload = {
-                        placeId: game.placeId,
-                        name: game.name || "Active Experience",
-                        builder: game.creatorName || "Robloxian",
-                        time: `Discovered at ${timestamp}`
-                    };
-
-                    // Broadcast directly to your left column
-                    io.emit('new-game-created', payload);
-                }
-            });
+                });
+            }
         }
     } catch (error) {
-        console.log("[SYSTEM] Discovery loop waiting on rate limits...");
+        console.log("[SYSTEM] Re-centering tracker filters...");
     }
 }
 
-// Fallback logic for Deletions: Instead of guessing sequential numbers backwards,
-// we scan the *already discovered active games list* to see if any of them suddenly break/get banned!
+// Check if any of our newly cached games suddenly drop offline / get moderated
 async function scanActiveListForBans() {
     if (seenGames.size === 0) return;
 
-    const idsToTest = Array.from(seenGames).slice(-30); // Grab the 30 most recently seen games
+    const idsToTest = Array.from(seenGames).slice(-20);
     const idString = idsToTest.join(',');
     const url = `https://games.roproxy.com/v1/games/multiget-place-details?placeIds=${idString}`;
 
@@ -69,26 +78,26 @@ async function scanActiveListForBans() {
 
         idsToTest.forEach(id => {
             const gameData = activeMap[id];
-            // If it was working a minute ago, but now returns an absolute reasonProhibited statement, it's a confirmed live ban!
+            
+            // Catching instances where the place instantly sets flags or vanishes
             if (gameData && gameData.reasonProhibited && gameData.reasonProhibited !== "None") {
                 const timestamp = new Date().toLocaleTimeString();
                 io.emit('status-update', {
                     placeId: id,
                     name: gameData.name || "Banned Experience",
                     type: 'deleted',
-                    time: `Banned at ${timestamp}`
+                    time: `Flagged at ${timestamp}`
                 });
-                // Remove from active tracking so it doesn't loop spam
                 seenGames.delete(id);
             }
         });
     } catch (error) {}
 }
 
-// Polling intervals optimized for platform API limits
-setInterval(scanNewCreations, 4000);       // Look for active platform games every 4 seconds
-setInterval(scanActiveListForBans, 10000);  // Cross-reference moderation status every 10 seconds
+// Set up stable intervals to avoid hitting proxy rate gates
+setInterval(scanNewCreations, 5000);       // Fetch fresh configurations every 5 seconds
+setInterval(scanActiveListForBans, 12000);  // Screen moderation adjustments every 12 seconds
 
 server.listen(3000, () => {
-    console.log('Roblox Platform Scraper Engine Online (Non-Sequential Framework).');
+    console.log('Catalog Asset Link Discovery Engine Online.');
 });
