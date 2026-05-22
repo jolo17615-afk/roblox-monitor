@@ -10,80 +10,56 @@ const io = new Server(server);
 app.use(express.static(__dirname));
 app.use(express.static('public'));
 
-// Global Tracking pointers
-let highestPlaceId = 14000000000; // Track the absolute newest game ID
-let banScanPointer = highestPlaceId;
+// Keeps track of games we've already displayed so we don't duplicate them
+const seenGames = new Set();
 
-// 1. Anchor the scanner to the current frontier of Roblox creations
-async function initializeHighestId() {
-    try {
-        const response = await axios.get('https://games.roproxy.com/v1/games/list?sortFilter=1&timeFilter=0&genreFilter=1');
-        if (response.data && response.data.data && response.data.data.length > 0) {
-            const ids = response.data.data.map(game => game.placeId);
-            highestPlaceId = Math.max(...ids);
-            banScanPointer = highestPlaceId - 100;
-            console.log(`[SYSTEM] Scanner initialized at current highest ID: ${highestPlaceId}`);
-        }
-    } catch (err) {
-        console.log("[SYSTEM] Using baseline ID pointer.");
-    }
-}
-
-// 2. LIVE CREATION TRACKER (Scans forward for new IDs)
+// Fetch newly populated games from Roblox's real-time sorting filters
 async function scanNewCreations() {
-    // Look at the next 15 numeric IDs ahead of our highest known ID
-    const lookAheadCount = 15;
-    const idsToTest = [];
-    for (let i = 1; i <= lookAheadCount; i++) {
-        idsToTest.push(highestPlaceId + i);
-    }
-
-    const idString = idsToTest.join(',');
-    const url = `https://games.roproxy.com/v1/games/multiget-place-details?placeIds=${idString}`;
-
     try {
+        // This endpoint returns an active feed of experiences currently updating/running on the platform
+        // sortFilter=1 (Popular/Recently Updated) or custom token scraping
+        const url = 'https://games.roproxy.com/v1/games/list?sortFilter=1&timeFilter=0&genreFilter=1&maxRows=25';
         const response = await axios.get(url);
-        const foundGames = response.data;
+        
+        if (response.data && response.data.data) {
+            const currentGames = response.data.data;
 
-        if (foundGames && foundGames.length > 0) {
-            // Sort them so they register in perfect sequential order
-            foundGames.sort((a, b) => a.placeId - b.placeId);
+            currentGames.forEach(game => {
+                // If it's a completely new ID our tracker hasn't caught yet
+                if (!seenGames.has(game.placeId)) {
+                    seenGames.add(game.placeId);
 
-            foundGames.forEach(game => {
-                if (game.placeId > highestPlaceId) {
-                    highestPlaceId = game.placeId; // Push the frontier forward
-                    
+                    // Prevent memory leak by keeping cache limited to last 1000 items
+                    if (seenGames.size > 1000) {
+                        const firstKey = seenGames.values().next().value;
+                        seenGames.delete(firstKey);
+                    }
+
                     const timestamp = new Date().toLocaleTimeString();
                     const payload = {
                         placeId: game.placeId,
-                        name: game.name || "New Experience",
+                        name: game.name || "Active Experience",
                         builder: game.creatorName || "Robloxian",
-                        time: `Just now (${timestamp})`
+                        time: `Discovered at ${timestamp}`
                     };
 
-                    // Send to the live creation feed
+                    // Broadcast directly to your left column
                     io.emit('new-game-created', payload);
                 }
             });
         }
     } catch (error) {
-        // Fail silently during proxy rate limits
+        console.log("[SYSTEM] Discovery loop waiting on rate limits...");
     }
 }
 
-// 3. LIVE DELETION MONITOR (Scans backward for bans)
-async function scanGlobalDeletions() {
-    const idsToScan = [];
-    for (let i = 0; i < 30; i++) {
-        idsToScan.push(banScanPointer - i);
-    }
-    
-    banScanPointer -= 30;
-    if (banScanPointer < (highestPlaceId - 3000)) {
-        banScanPointer = highestPlaceId; // Loop back up to stay near recent games
-    }
+// Fallback logic for Deletions: Instead of guessing sequential numbers backwards,
+// we scan the *already discovered active games list* to see if any of them suddenly break/get banned!
+async function scanActiveListForBans() {
+    if (seenGames.size === 0) return;
 
-    const idString = idsToScan.join(',');
+    const idsToTest = Array.from(seenGames).slice(-30); // Grab the 30 most recently seen games
+    const idString = idsToTest.join(',');
     const url = `https://games.roproxy.com/v1/games/multiget-place-details?placeIds=${idString}`;
 
     try {
@@ -91,29 +67,28 @@ async function scanGlobalDeletions() {
         const activeMap = {};
         response.data.forEach(game => { activeMap[game.placeId] = game; });
 
-        idsToScan.forEach(id => {
+        idsToTest.forEach(id => {
             const gameData = activeMap[id];
+            // If it was working a minute ago, but now returns an absolute reasonProhibited statement, it's a confirmed live ban!
             if (gameData && gameData.reasonProhibited && gameData.reasonProhibited !== "None") {
                 const timestamp = new Date().toLocaleTimeString();
                 io.emit('status-update', {
                     placeId: id,
-                    name: gameData.name || "Modded Experience",
+                    name: gameData.name || "Banned Experience",
                     type: 'deleted',
-                    time: `Today at ${timestamp}`
+                    time: `Banned at ${timestamp}`
                 });
+                // Remove from active tracking so it doesn't loop spam
+                seenGames.delete(id);
             }
         });
     } catch (error) {}
 }
 
-// Boot routines
-initializeHighestId().then(() => {
-    // Scan for new games every 2 seconds for true live feed speed
-    setInterval(scanNewCreations, 2000);
-    // Scan for deletions every 6 seconds
-    setInterval(scanGlobalDeletions, 6000);
-});
+// Polling intervals optimized for platform API limits
+setInterval(scanNewCreations, 4000);       // Look for active platform games every 4 seconds
+setInterval(scanActiveListForBans, 10000);  // Cross-reference moderation status every 10 seconds
 
 server.listen(3000, () => {
-    console.log('Dual Tracking Engines Online.');
+    console.log('Roblox Platform Scraper Engine Online (Non-Sequential Framework).');
 });
