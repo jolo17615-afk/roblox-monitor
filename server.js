@@ -17,90 +17,167 @@ app.get('/', (req, res) => {
     });
 });
 
-const trackedGames = new Set();
+// ==========================================
+// CENTRAL STATE STORAGE (Database & Deduplication)
+// ==========================================
+const db_known_universes = new Set();
+const discovery_queue = [];
+let latest_discovered_universe_id = 1400000000; 
 
-async function streamLiveGames() {
+// A list of high-profile/frequent modded and clone deployment Group IDs to track (Pipeline A)
+const TARGET_GROUPS = [32451225, 12007609, 5459955, 16402302, 33119041];
+const TARGET_KEYWORDS = ['mm2', 'murder', 'modded', 'knife', 'trade'];
+let keywordIndex = 0;
+
+// User-Agent Pool for Rotation (Rate Limit Handling)
+const USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+];
+function getRotatedHeader() {
+    return {
+        'User-Agent': USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)],
+        'Accept': 'application/json'
+    };
+}
+
+// ==========================================
+// CENTRAL PIPELINE PROCESSING WORKER (Validation)
+// ==========================================
+async function processValidationQueue() {
+    if (discovery_queue.length === 0) return;
+
+    // Process tasks in micro-batches to respect proxy limits
+    const batch = discovery_queue.splice(0, 15);
+    const uniqueIds = [...new Set(batch)].filter(id => !db_known_universes.has(id));
+
+    if (uniqueIds.length === 0) return;
+
     try {
-        console.log("Fetching live platform data stream...");
+        const idString = uniqueIds.join(',');
+        const url = `https://games.roproxy.com/v1/games?universeIds=${idString}`;
         
-        // Rolimons provides a wide-open API containing a directory of actively tracked platform experiences
-        const response = await axios.get('https://api.rolimons.com/games/v1/gamelist', {
-            headers: { 'User-Agent': 'Mozilla/5.0' }
-        });
-
-        if (response.data && response.data.success && response.data.games) {
-            const gamesData = response.data.games;
-            const placeIds = Object.keys(gamesData);
-            
-            // Grab the last 15 active games shifting player weights
-            const currentBatch = placeIds.slice(-15);
-
-            currentBatch.forEach(id => {
-                const gameDetails = gamesData[id]; // Format: [Name, ActivePlayers, IconURL...]
-                const gameName = gameDetails[0] || "Active Experience";
-                const activePlayers = gameDetails[1] || 0;
-
-                if (!trackedGames.has(id)) {
-                    trackedGames.add(id);
-
-                    // Prevent local server cache flooding
-                    if (trackedGames.size > 200) {
-                        const firstKey = trackedGames.values().next().value;
-                        trackedGames.delete(firstKey);
+        const response = await axios.get(url, { headers: getRotatedHeader() });
+        
+        if (response.data && response.data.data) {
+            response.data.data.forEach(game => {
+                if (!db_known_universes.has(game.universeId)) {
+                    
+                    // Commit to local DB state
+                    db_known_universes.add(game.universeId);
+                    if (game.universeId > latest_discovered_universe_id) {
+                        latest_discovered_universe_id = game.universeId;
                     }
 
                     const timestamp = new Date().toLocaleTimeString();
                     
-                    // Fire a guaranteed event over to your left "Live Creations" column
+                    // WebSocket Event Delivery
                     io.emit('new-game-created', {
-                        placeId: id,
-                        name: gameName,
-                        builder: `Active Players: ${activePlayers.toLocaleString()}`,
-                        time: `Streaming live (${timestamp})`
+                        placeId: game.rootPlaceId,
+                        name: game.name || "Discovered Experience",
+                        builder: game.creator.name || "Developer",
+                        time: `Discovered [Pipeline Delta] • ${timestamp}`
                     });
+
+                    // Live Check if it gets instantly auto-moderated
+                    if (game.reasonProhibited && game.reasonProhibited !== "None") {
+                        io.emit('status-update', {
+                            placeId: game.rootPlaceId,
+                            name: game.name,
+                            type: 'deleted',
+                            time: `Banned instantly • ${timestamp}`
+                        });
+                    }
                 }
             });
         }
-    } catch (error) {
-        console.error("Data stream connection error:", error.message);
+    } catch (err) {
+        // Backoff simulation: if rate-limited, push back into queue tail
+        console.log("[WORKER] Rate gateway hit. Re-queuing IDs for backoff execution.");
+        uniqueIds.forEach(id => discovery_queue.push(id));
     }
 }
 
-// Check the network cache stream for sudden moderation dropouts or bans
-async function checkLiveDeletions() {
-    if (trackedGames.size === 0) return;
-
-    // Test a cross-slice of currently active IDs
-    const testList = Array.from(trackedGames).slice(-10);
-    
-    for (const id of testList) {
+// ==========================================
+// PIPELINE A — Creator / Group Tracking Worker
+// ==========================================
+async function runPipelineA() {
+    console.log("[PIPELINE A] Inspecting group networks...");
+    for (const groupId of TARGET_GROUPS) {
         try {
-            // Using a raw thumbnail proxy check—if a game is banned, its asset endpoints explicitly fail
-            const checkUrl = `https://thumbnails.roproxy.com/v1/games/icons?placeIds=${id}&returnPolicy=PlaceHolder&size=50x50&format=Png&isCircular=false`;
-            const res = await axios.get(checkUrl);
+            const url = `https://games.roproxy.com/v2/groups/${groupId}/games?accessFilter=All&sortOrder=Desc&limit=15`;
+            const response = await axios.get(url, { headers: getRotatedHeader() });
             
-            if (res.data && res.data.data && res.data.data[0]) {
-                const item = res.data.data[0];
-                // If Roblox moderation replaces the thumbnail icon with an error state, it's banned
-                if (item.state === "Blocked" || item.state === "Error") {
-                    const timestamp = new Date().toLocaleTimeString();
-                    io.emit('status-update', {
-                        placeId: id,
-                        name: "Experience Banned / Deleted",
-                        type: 'deleted',
-                        time: `Detected at ${timestamp}`
-                    });
-                    trackedGames.delete(id);
-                }
+            if (response.data && response.data.data) {
+                response.data.data.forEach(game => {
+                    if (!db_known_universes.has(game.universeId)) {
+                        discovery_queue.push(game.universeId);
+                    }
+                });
             }
-        } catch (err) {}
+        } catch (e) {}
+        await new Promise(r => setTimeout(r, 1000)); // Internal throttling pause
     }
 }
 
-// Optimized timing limits to stay clean under proxy firewalls
-setInterval(streamLiveGames, 7000);   // Pull the active matrix every 7 seconds
-setInterval(checkLiveDeletions, 15000); // Check for flags every 15 seconds
+// ==========================================
+// PIPELINE B — Discovery Feed Diffing Worker
+// ==========================================
+async function runPipelineB() {
+    const keyword = TARGET_KEYWORDS[keywordIndex];
+    keywordIndex = (keywordIndex + 1) % TARGET_KEYWORDS.length;
+    console.log(`[PIPELINE B] Calculating feed diffs for keyword: ${keyword}`);
+
+    try {
+        const url = `https://games.roproxy.com/v1/games/list?keyword=${keyword}&maxRows=25`;
+        const response = await axios.get(url, { headers: getRotatedHeader() });
+
+        if (response.data && response.data.data) {
+            response.data.data.forEach(game => {
+                // If your multiget returns placeIds, map them directly into checking pipelines
+                if (game.universeId && !db_known_universes.has(game.universeId)) {
+                    discovery_queue.push(game.universeId);
+                }
+            });
+        }
+    } catch (e) {}
+}
+
+// ==========================================
+// PIPELINE C — Universe ID Probing Worker
+// ==========================================
+async function runPipelineC() {
+    console.log(`[PIPELINE C] Probing numeric clusters near: ${latest_discovered_universe_id}`);
+    
+    // Generate an asynchronous offset scan block right ahead of our highest verified boundary
+    const startRange = latest_discovered_universe_id + 1;
+    const endRange = startRange + 40;
+
+    for (let targetId = startRange; targetId < endRange; targetId++) {
+        if (!db_known_universes.has(targetId)) {
+            discovery_queue.push(targetId);
+        }
+    }
+}
+
+// ==========================================
+// CRON SCHEDULER MATRIX
+// ==========================================
+// Central Validation Worker processes the queue at hyper-speed intervals
+setInterval(processValidationQueue, 2500);
+
+// Independent ingestion loops to keep queues full of delta indicators
+setInterval(runPipelineA, 45000); // Poll targets every 45 seconds
+setInterval(runPipelineB, 20000); // Diff search terms every 20 seconds
+setInterval(runPipelineC, 30000); // Probe ranges every 30 seconds
+
+// Boot setup
+setTimeout(() => {
+    runPipelineA();
+    runPipelineB();
+}, 2000);
 
 server.listen(3000, () => {
-    console.log('Rolimons Sync Matrix Engine Active.');
+    console.log('--- ENTERPRISE DISCOVERY CORE RUNNING ---');
 });
