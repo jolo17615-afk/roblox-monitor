@@ -7,6 +7,8 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
+// This tells the server to look in the main folder OR a public folder
+app.use(express.static(__dirname));
 app.use(express.static('public'));
 
 // The list of Place IDs you want to actively monitor
