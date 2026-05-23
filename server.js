@@ -17,86 +17,122 @@ app.get('/', (req, res) => {
     });
 });
 
-const seenAssets = new Set();
-let mockCounter = 5810000000; // Baseline current 2026 ID tracker
+// Cache map to track live game states and catch transitions without duplicates
+const activePlatformCache = new Map();
 
 // ==========================================
-// THE ULTRA-RELIABLE GLOBAL DISCOVERY LAYER
+// REAL DATA PIPELINE: ROLIMONS PLATFORM STREAM
 // ==========================================
-async function streamLivePlatformPulse() {
+async function fetchRealPlatformData() {
     try {
-        // Scrapes the global catalog item stream for bundles and assets. 
-        // This directory endpoint remains highly stable and accessible without strict session challenges.
-        const url = 'https://catalog.roproxy.com/v1/search/items?category=3&subcategory=3&sortType=3&limit=25';
-        const response = await axios.get(url, {
+        console.log("[INJECTOR] Requesting live platform data from tracking matrix...");
+        
+        // This endpoint acts as a wide-open global discovery cache of thousands of active platform games,
+        // updating their user counts and status variations continuously.
+        const response = await axios.get('https://api.rolimons.com/games/v1/gamelist', {
             headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
-            timeout: 5000
+            timeout: 6000
         });
 
-        if (response.data && response.data.data && response.data.data.length > 0) {
-            response.data.data.forEach(item => {
-                const assetId = item.id;
-                
-                if (assetId && !seenAssets.has(assetId)) {
-                    seenAssets.add(assetId);
+        if (response.data && response.data.success && response.data.games) {
+            const currentGamesMap = response.data.games; // Key: placeId, Value: [Name, Players, ...]
+            const placeIds = Object.keys(currentGamesMap);
+            
+            // Look at a rotating slice of active platform entities
+            placeIds.slice(-40).forEach(id => {
+                const gameInfo = currentGamesMap[id];
+                const gameName = gameInfo[0] || `Place #${id}`;
+                const activeCount = gameInfo[1] || 0;
 
-                    // Prevent local server memory overflowing
-                    if (seenAssets.size > 300) {
-                        const firstKey = seenAssets.values().next().value;
-                        seenAssets.delete(firstKey);
-                    }
+                const numericId = parseInt(id);
+
+                // State logic: If this is the first time our server sees the game during this lifecycle
+                if (!activePlatformCache.has(numericId)) {
+                    // Log it to our state storage
+                    activePlatformCache.set(numericId, { name: gameName, status: 'active' });
 
                     const timestamp = new Date().toLocaleTimeString();
-                    
-                    // Route directly to your Live Creations column
+
+                    // Emit to the Left Panel (Live Creations/Discoveries)
                     io.emit('new-game-created', {
-                        placeId: assetId,
-                        name: item.name || "Active Experience Slot",
-                        builder: item.creatorName || "Roblox Creator",
-                        time: `Live Streamed • ${timestamp}`
+                        placeId: numericId,
+                        name: gameName,
+                        builder: `Active Players: ${activeCount.toLocaleString()}`,
+                        time: `Live Stream • ${timestamp}`
                     });
                 }
             });
-        } else {
-            // FALLBACK FAIL-SAFE RUNNER: If the proxies completely freeze our requests,
-            // this fallback cluster simulator forces live, high-velocity chronological tracking
-            // events right onto your dashboard interface so your site stays up and functional.
-            triggerFallbackStream();
+
+            // Clean up cache matrix if it expands too large for Render's free RAM limits
+            if (activePlatformCache.size > 1000) {
+                const keysArray = Array.from(activePlatformCache.keys());
+                for (let i = 0; i < 200; i++) {
+                    activePlatformCache.delete(keysArray[i]);
+                }
+            }
         }
     } catch (error) {
-        triggerFallbackStream();
+        console.log(`[PIPELINE ERROR] Stream timed out or proxy network busy: ${error.message}`);
     }
 }
 
-function triggerFallbackStream() {
-    // Generates a simulated sequential creation tick matching actual 2026 platform velocities
-    mockCounter += Math.floor(Math.random() * 3) + 1;
-    const timestamp = new Date().toLocaleTimeString();
+// ==========================================
+// REAL DATA PIPELINE: ACTIVE DELETION MONITOR
+// ==========================================
+async function checkCacheForModerationDeltas() {
+    if (activePlatformCache.size === 0) return;
+
+    // Pull the 15 most recent active items from our tracking stream to scan for live drops
+    const trackedKeys = Array.from(activePlatformCache.keys()).slice(-15);
     
-    const randomNames = ["Modded Server", "MM2 Trading", "Knife Hangout", "Custom Hub", "Testing Ground"];
-    const selectedName = randomNames[Math.floor(Math.random() * randomNames.length)];
+    for (const placeId of trackedKeys) {
+        const cachedData = activePlatformCache.get(placeId);
+        if (cachedData.status === 'deleted') continue; // Skip if already flagged
 
-    io.emit('new-game-created', {
-        placeId: mockCounter,
-        name: `${selectedName} #${Math.floor(Math.random() * 900) + 100}`,
-        builder: "Automated Deployer",
-        time: `Cluster Discovery • ${timestamp}`
-    });
+        try {
+            // We use an unauthenticated raw asset thumbnail endpoint to verify the game's life cycle.
+            // If Roblox completely removes or bans a game, this endpoint changes its state token.
+            const url = `https://thumbnails.roproxy.com/v1/games/icons?placeIds=${placeId}&returnPolicy=PlaceHolder&size=50x50&format=Png&isCircular=false`;
+            const res = await axios.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 4000 });
+            
+            if (res.data && res.data.data && res.data.data[0]) {
+                const statusMeta = res.data.data[0];
+                
+                // "Blocked" or "Error" codes confirm that the place asset has been taken down by Roblox moderation
+                if (statusMeta.state === "Blocked" || statusMeta.state === "Error") {
+                    const timestamp = new Date().toLocaleTimeString();
+                    
+                    // Update internal status state so we don't duplicate logs
+                    cachedData.status = 'deleted';
+                    activePlatformCache.set(placeId, cachedData);
 
-    // Simulate occasional live moderation hits to populate your right column
-    if (Math.random() > 0.75) {
-        io.emit('status-update', {
-            placeId: mockCounter - Math.floor(Math.random() * 10),
-            name: `${selectedName} Instance`,
-            type: 'deleted',
-            time: `Banned Live • ${timestamp}`
-        });
+                    // Emit to the Right Panel (Live Deletions)
+                    io.emit('status-update', {
+                        placeId: placeId,
+                        name: cachedData.name,
+                        type: 'deleted',
+                        time: `Detected Wave • ${timestamp}`
+                    });
+                }
+            }
+        } catch (err) {
+            // Drop execution gracefully during temporary network rate limit spikes
+        }
+        
+        // Minor 1-second delay between validation packets to avoid throttling
+        await new Promise(r => setTimeout(r, 1000));
     }
 }
 
-// Stream data to the UI at regular intervals
-setInterval(streamLivePlatformPulse, 4000);
+// Set up clean execution intervals targeting real platform data structures
+setInterval(fetchRealPlatformData, 10000);       // Fetch active streams every 10 seconds
+setInterval(checkCacheForModerationDeltas, 20000); // Verify moderation state changes every 20 seconds
+
+// Boot routine
+setTimeout(() => {
+    fetchRealPlatformData();
+}, 2000);
 
 server.listen(3000, () => {
-    console.log('--- RELIABLE PACKET PLATFORM ENGINE LIVE ---');
+    console.log('--- REWRITTEN REAL-TIME PRODUCTION STREAM ENGINE ONLINE ---');
 });
