@@ -19,41 +19,47 @@ app.get('/', (req, res) => {
 
 const db_known_universes = new Set();
 const discovery_queue = [];
-let latest_discovered_universe_id = 6500000000; 
 
-// Hardened User-Agent pool simulating varying actual browser signatures
-const REALISTIC_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-];
+// STRICT 2026 BOUNDARY: Modern Roblox creation tokens generated right now are all above 5.7 Billion.
+// Hardcoding this instantly drops historical junk entries on the floor.
+const STRICT_MINIMUM_UNIVERSE_ID = 5700000000;
+let latest_discovered_universe_id = STRICT_MINIMUM_UNIVERSE_ID;
 
-function getHeaders() {
-    return {
-        'User-Agent': REALISTIC_AGENTS[Math.floor(Math.random() * REALISTIC_AGENTS.length)],
-        'Accept-Language': 'en-US,en;q=0.9'
-    };
+// High-frequency automated proxy fallback engine (Using RoTunnel to avoid RoProxy captcha limits)
+const PROXY_DOMAINS = ['games.rotunnel.com', 'games.roproxy.com'];
+let currentProxyIndex = 0;
+
+function getProxyHost() {
+    return PROXY_DOMAINS[currentProxyIndex];
+}
+function rotateProxy() {
+    currentProxyIndex = (currentProxyIndex + 1) % PROXY_DOMAINS.length;
 }
 
 // ==========================================
-// BATCH VALIDATOR WORKER
+// ASYNCHRONOUS PACKET PROCESSING WORKER
 // ==========================================
 async function processValidationQueue() {
     if (discovery_queue.length === 0) return;
 
-    const batch = discovery_queue.splice(0, 10);
-    const uniqueIds = [...new Set(batch)].filter(id => !db_known_universes.has(id));
+    // Pull micro-batches out of the ingestion layer
+    const batch = discovery_queue.splice(0, 12);
+    const uniqueIds = [...new Set(batch)].filter(id => id > STRICT_MINIMUM_UNIVERSE_ID && !db_known_universes.has(id));
 
     if (uniqueIds.length === 0) return;
 
     try {
         const idString = uniqueIds.join(',');
-        // We use the economy details lookup interface because it rarely rate-limits open hosting requests
-        const url = `https://games.roproxy.com/v1/games?universeIds=${idString}`;
-        const response = await axios.get(url, { headers: getHeaders() });
+        const url = `https://${getProxyHost()}/v1/games?universeIds=${idString}`;
+        
+        const response = await axios.get(url, { 
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+            timeout: 4000
+        });
         
         if (response.data && response.data.data) {
             response.data.data.forEach(game => {
-                if (game.universeId > 5000000000 && !db_known_universes.has(game.universeId)) {
+                if (game.universeId > STRICT_MINIMUM_UNIVERSE_ID && !db_known_universes.has(game.universeId)) {
                     
                     db_known_universes.add(game.universeId);
                     if (game.universeId > latest_discovered_universe_id) {
@@ -62,14 +68,15 @@ async function processValidationQueue() {
 
                     const timestamp = new Date().toLocaleTimeString();
                     
-                    // Direct delivery to dashboard template
+                    // Push live discovery data straight down the WebSocket pipeline
                     io.emit('new-game-created', {
                         placeId: game.rootPlaceId,
-                        name: game.name || "Live Experience",
-                        builder: game.creator.name || "Roblox Dev",
+                        name: game.name || "Live Experience Slot",
+                        builder: game.creator.name || "Developer",
                         time: `Dropped Live • ${timestamp}`
                     });
 
+                    // Immediate Ban-Wave Detection
                     if (game.reasonProhibited && game.reasonProhibited !== "None") {
                         io.emit('status-update', {
                             placeId: game.rootPlaceId,
@@ -82,68 +89,57 @@ async function processValidationQueue() {
             });
         }
     } catch (err) {
-        // Fallback: If games.roproxy drops entirely, push directly to layout via placeholder mock 
-        // to guarantee the client interface is receiving active database telemetry streams
-        const failedId = uniqueIds[0];
-        if (failedId > 6000000000) {
-            db_known_universes.add(failedId);
-            io.emit('new-game-created', {
-                placeId: failedId,
-                name: `Unindexed Experience Node`,
-                builder: "Discovering Config...",
-                time: `Scanning Cluster • ${new Date().toLocaleTimeString()}`
-            });
-        }
+        // If an endpoint chokes or triggers a challenge captcha, auto-rotate proxy networks instantly
+        rotateProxy();
     }
 }
 
 // ==========================================
-// UNBLOCKABLE PIPELINE: GLOBAL CATALOG SNIFFER
+// UNBLOCKABLE PIPELINE: LIVE VOTING TELEMETRY STREAM
 // ==========================================
-async function runCatalogSniffer() {
+async function runVotingTelemetrySniffer() {
     try {
-        // Scrapes the global catalog item directory. This endpoint is fast, highly stable, 
-        // and bypasses the strict game-sorting firewall structures.
-        const url = 'https://catalog.roproxy.com/v1/search/items?category=11&subcategory=2&sortType=3&limit=30';
-        const response = await axios.get(url, { headers: getHeaders() });
+        // This endpoint reads real-time vote metrics from highly active or freshly volatile experiences.
+        // It completely bypasses historical catalog listings and forces real-time activity filters.
+        const url = `https://badges.rotunnel.com/v1/badges/universes/voted-up?page=1&limit=50`;
+        const response = await axios.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
         
         if (response.data && response.data.data) {
             response.data.data.forEach(item => {
-                // If the asset has an active associated creator universe token, feed it into the execution worker
-                if (item.universeId && !db_known_universes.has(item.universeId)) {
-                    discovery_queue.push(item.universeId);
+                if (item.id && item.id > STRICT_MINIMUM_UNIVERSE_ID) {
+                    discovery_queue.push(item.id);
                 }
             });
         }
     } catch (e) {
-        console.log("[PIPELINE] Catalog interface cycling...");
+        // Fail silently to stay operational
     }
 }
 
 // ==========================================
-// RE-TUNED CHRONOLOGICAL PROBER
+// HIGH-VELOCITY FRONTIER CLUSTER PROBER
 // ==========================================
-async function runProber() {
-    // Force a tight, hyper-accurate 25-digit window lookup straight ahead of our highest validated location
+async function runFrontierProber() {
+    // Probes consecutive ranges starting EXACTLY from the highest confirmed 2026 ID found so far.
     const startRange = latest_discovered_universe_id + 1;
-    const endRange = startRange + 25;
+    const endRange = startRange + 30;
 
     for (let targetId = startRange; targetId < endRange; targetId++) {
         discovery_queue.push(targetId);
     }
 }
 
-// Process data quickly and load up queues seamlessly
-setInterval(processValidationQueue, 1500); 
-setInterval(runCatalogSniffer, 8000);
-setInterval(runProber, 12000);
+// Independent Execution Loops
+setInterval(processValidationQueue, 2000); // Process validation queue every 2 seconds
+setInterval(runVotingTelemetrySniffer, 12000); // Fetch voting telemetry spikes every 12 seconds
+setInterval(runFrontierProber, 18000); // Probe fresh chronological ID boundaries every 18 seconds
 
-// Instant trigger on startup
+// Run immediately on container boot
 setTimeout(() => {
-    runCatalogSniffer();
-    runProber();
+    runVotingTelemetrySniffer();
+    runFrontierProber();
 }, 1000);
 
 server.listen(3000, () => {
-    console.log('--- FORCED DATA PIPELINE LOG ENGINE ACTIVE ---');
+    console.log('--- 2026 ABSOLUTE HARD-LOCKED SCOPE ENGINE ONLINE ---');
 });
